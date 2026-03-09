@@ -23,7 +23,17 @@ if (!TELEGRAM_TOKEN || TELEGRAM_TOKEN === "your_telegram_bot_token_here") {
 
 // ─── Bot ─────────────────────────────────────────────────────────────────────
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+let bot;
+if (require.main === module) {
+  bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+} else {
+  // Test mode: inject a mock via setBotInstance()
+  bot = null;
+}
+
+function setBotInstance(mockBot) {
+  bot = mockBot;
+}
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -175,16 +185,17 @@ async function ensureSession(chatId) {
 async function handleUserMessage(chatId, text) {
   const state = getState(chatId);
 
+  // If user is answering an active question, treat this as custom answer first.
+  // Question flows happen while session is still "busy", so this must win over queueing.
+  if (state.questionState) {
+    await handleCustomQuestionAnswer(chatId, text);
+    return;
+  }
+
   // If AI is busy, queue the message
   if (state.busy) {
     state.pendingQueue.push(text);
     await bot.sendMessage(chatId, "⏳ Still working on the previous request, I'll reply to this next.").catch(() => {});
-    return;
-  }
-
-  // If user is in the middle of answering a question, treat this as the custom answer
-  if (state.questionState) {
-    await handleCustomQuestionAnswer(chatId, text);
     return;
   }
 
@@ -554,6 +565,7 @@ async function connectSSE() {
 
 // ─── Telegram callback queries (button taps) ─────────────────────────────────
 
+if (require.main === module) {
 bot.on("callback_query", async (query) => {
   const chatId = query.message?.chat?.id;
   const data = query.data || "";
@@ -718,6 +730,7 @@ bot.on("message", async (msg) => {
 
   await handleUserMessage(chatId, text);
 });
+} // end if (require.main === module) for Telegram handlers
 
 // ─── Startup: re-register existing Telegram sessions ─────────────────────────
 
@@ -760,24 +773,71 @@ async function rehydrateSessions() {
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
-// Handle uncaught errors gracefully — don't crash the bot
-process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException]", err.message, err.stack);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("[unhandledRejection]", reason);
-});
+if (require.main === module) {
+  // Handle uncaught errors gracefully — don't crash the bot
+  process.on("uncaughtException", (err) => {
+    console.error("[uncaughtException]", err.message, err.stack);
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error("[unhandledRejection]", reason);
+  });
 
-// Graceful shutdown
-process.on("SIGINT", () => {
-  console.log("\n[SHUTDOWN] Stopping bot...");
-  if (sseAbortController) sseAbortController.abort();
-  bot.stopPolling();
-  process.exit(0);
-});
+  // Graceful shutdown
+  process.on("SIGINT", () => {
+    console.log("\n[SHUTDOWN] Stopping bot...");
+    if (sseAbortController) sseAbortController.abort();
+    bot.stopPolling();
+    process.exit(0);
+  });
 
-console.log(`[BOT] Starting OpenCode Telegram Bot`);
-console.log(`[BOT] OpenCode server: ${OPENCODE_URL}`);
+  console.log(`[BOT] Starting OpenCode Telegram Bot`);
+  console.log(`[BOT] OpenCode server: ${OPENCODE_URL}`);
 
-// Re-register existing sessions, then start SSE listener
-rehydrateSessions().then(() => connectSSE());
+  // Re-register existing sessions, then start SSE listener
+  rehydrateSessions().then(() => connectSSE());
+}
+
+// ─── Exports for testing (no-op in production) ────────────────────────────────
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    setBotInstance,
+    // State
+    getState,
+    chatState,
+    sessionToChat,
+    // OpenCode HTTP
+    authHeader,
+    ocFetch,
+    createSession,
+    sendPromptAsync,
+    replyPermission,
+    replyQuestion,
+    rejectQuestion,
+    fetchLastAssistantText,
+    // Typing
+    startTyping,
+    stopTyping,
+    // Messaging
+    sendLong,
+    // Session
+    ensureSession,
+    // Handlers
+    handleUserMessage,
+    drainQueue,
+    handlePermissionAsked,
+    handleQuestionAsked,
+    askCurrentQuestion,
+    handleCustomQuestionAnswer,
+    advanceQuestionAnswer,
+    handleSessionIdle,
+    handleSessionError,
+    // SSE
+    dispatchEvent,
+    // Startup
+    rehydrateSessions,
+    // Constants (for test assertions)
+    TYPING_INTERVAL_MS,
+    INTERACTION_TIMEOUT_MS,
+    SSE_RECONNECT_DELAY_MS,
+  };
+}

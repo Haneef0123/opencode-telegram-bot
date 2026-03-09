@@ -1,0 +1,3 @@
+interface:
+  display_name: "Telegram Live E2E"
+  short_description: "Run comprehensive live Telegram bot end-to-end tests"
