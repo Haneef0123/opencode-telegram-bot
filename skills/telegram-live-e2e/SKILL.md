@@ -13,6 +13,16 @@ Use this skill to run a comprehensive live test of `bot.js` where messages are s
 - Need visible in-chat evidence for command and callback flows.
 - Need deterministic validation of edge cases while preserving real Telegram transport.
 
+## Quick Start (Recommended)
+
+From repo root:
+
+```bash
+node skills/telegram-live-e2e/scripts/run-live-comprehensive-telegram-e2e.js
+```
+
+This wrapper does preflight checks for required env vars and then runs the full live suite.
+
 ## Prerequisites
 
 - Run from repo root: `/Users/haneefshaikh/opencode-telegram-bot`.
@@ -35,7 +45,9 @@ node skills/telegram-live-e2e/scripts/generate-string-session.js
 - Add printed value to `.env`:
   - `TG_STRING_SESSION=...`
 
-## Run live comprehensive suite
+## Run Suite (Direct)
+
+If you want to bypass wrapper checks:
 
 ```bash
 node skills/telegram-live-e2e/scripts/live-comprehensive-telegram-e2e.js
@@ -68,6 +80,12 @@ What this does:
 
 ## Troubleshooting
 
+- `listen EPERM` on localhost during tests:
+  - Environment/sandbox blocked local bind.
+  - Re-run with permissions that allow local server sockets.
+- `ENOTFOUND api.telegram.org` / Telegram connect EPERM:
+  - Environment/sandbox blocked outbound network.
+  - Re-run with outbound network enabled.
 - `409 Conflict: terminated by other getUpdates request`:
   - Another bot instance is running with same token.
   - Stop competing process and rerun.
@@ -83,3 +101,9 @@ After run, report:
 - Failed steps (if any) with error
 - Tag used (`[LIVE-E2E-...]`) so user can find messages in chat
 - Any caveats (`409`, flood wait, session issues)
+
+## Agent workflow notes
+
+- Always run this suite after major bot behavior changes.
+- Use wrapper command first; only use direct script command for debugging.
+- If flood wait appears, let run continue; script retries automatically.

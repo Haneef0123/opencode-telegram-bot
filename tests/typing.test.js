@@ -1,6 +1,7 @@
 "use strict";
 
 const { createMockFetch, createMockBot, resetBotState } = require("./helpers/setup");
+const logger = require("../src/utils/logger");
 
 process.env.TELEGRAM_BOT_TOKEN = "test-token";
 const botModule = require("../bot");
@@ -9,6 +10,7 @@ let mockBot;
 
 beforeEach(() => {
   jest.useFakeTimers();
+  jest.spyOn(logger, "warn").mockImplementation(() => {});
   resetBotState(botModule);
   mockBot = createMockBot();
   botModule.setBotInstance(mockBot);
@@ -17,6 +19,7 @@ beforeEach(() => {
 
 afterEach(() => {
   jest.useRealTimers();
+  jest.restoreAllMocks();
 });
 
 describe("startTyping", () => {

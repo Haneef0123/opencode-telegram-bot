@@ -6,9 +6,11 @@ process.env.TELEGRAM_BOT_TOKEN = "test-token";
 const botModule = require("../bot");
 
 let mockBot;
+let errorSpy;
 
 beforeEach(() => {
   jest.useFakeTimers();
+  errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
   resetBotState(botModule);
   mockBot = createMockBot();
   botModule.setBotInstance(mockBot);
@@ -16,6 +18,7 @@ beforeEach(() => {
 
 afterEach(() => {
   jest.useRealTimers();
+  jest.restoreAllMocks();
 });
 
 // ─── handleUserMessage ────────────────────────────────────────────────────────

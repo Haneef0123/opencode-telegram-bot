@@ -3,10 +3,12 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node bot.js",
+    "start": "node src/index.js",
+    "start:legacy": "node bot.js",
     "test": "jest --verbose --forceExit",
     "test:watch": "jest --watch --verbose --forceExit",
-    "test:e2e": "jest tests/e2e/bot-process.e2e.test.js --runInBand --verbose"
+    "test:e2e": "jest tests/e2e/bot-process.e2e.test.js --runInBand --verbose",
+    "test:live:e2e": "node skills/telegram-live-e2e/scripts/run-live-comprehensive-telegram-e2e.js"
   },
   "keywords": [],
   "author": "",

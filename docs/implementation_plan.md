@@ -4,6 +4,33 @@
 
 Safely refactor a monolithic 784-line `bot.js` into modular, DRY, SOLID-compliant code **without breaking anything**. Strategy: build a comprehensive test suite first, then refactor phase by phase with tests as the safety net.
 
+## Current Status (Updated: 2026-03-09)
+
+### Completed
+
+- Test infrastructure is in place (`jest.config.js`, `__mocks__/`, `tests/helpers/setup.js`).
+- Unit test suite is implemented and passing for:
+  - config, state, OpenCode client, typing, sendLong, session, handlers, permission, question, SSE
+- Command and callback behavior is currently validated through process-level E2E coverage
+  - (`tests/e2e/bot-process.e2e.test.js`) rather than separate `commands.test.js` / `callbacks.test.js` files.
+- Process-level E2E suite is implemented and passing:
+  - `tests/e2e/bot-process.e2e.test.js`
+  - Covers commands, queueing, permissions, questions, timeout behavior, callbacks, abort, SSE reconnect, and rehydration.
+- Test script added:
+  - `npm run test:e2e`
+- Full automated test status:
+  - **11 suites, 106 tests passing**
+
+### Completed but deviated from original Part A assumptions
+
+- `bot.js` needed one behavioral fix discovered by E2E:
+  - `handleUserMessage` now prioritizes `questionState` handling before `busy` queueing.
+  - This fixes live/custom-answer question flow while a session is busy.
+
+### Not yet started
+
+- Part B phased refactor (`src/config.js`, `SessionManager`, `OpenCodeClient`, etc.) remains pending.
+
 ---
 
 # PART A — Test Suite (Before Any Refactoring)
@@ -609,6 +636,9 @@ npm run test:watch
 ```
 
 **Expected outcome:** All 105+ tests pass against the **unmodified** `bot.js` (with only the export additions and side-effect guards).
+
+**Actual outcome (current):** 106 tests pass, including process-level E2E coverage.  
+`bot.js` includes one small behavioral fix (question custom-answer precedence over busy queueing), so it is no longer strictly "unmodified except exports/guards".
 
 ---
 
