@@ -152,3 +152,77 @@ log("CALLBACK", `RECEIVED chatId=${chatId} messageId=${messageId} data="${data}"
 ```
 
 Also added a log showing the current `questionState` at the moment of the tap, making requestId mismatches immediately visible.
+
+---
+
+## Bug 8 — `/model` showed "No providers found" despite OpenCode having providers configured
+
+**Symptom**: Sending `/model` always replied with "No providers found. Make sure OpenCode is running and providers are configured." even when OpenCode was running and had API keys set.
+
+**Root cause**: `fetchProviders()` assumed `provider.models` was an array and guarded with `Array.isArray(provider.models)`. In the real OpenCode API, `models` is a **plain object** (dict) keyed by model ID:
+
+```json
+{ "claude-sonnet-4-6": { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", ... } }
+```
+
+`Array.isArray({...})` is always `false`, so every provider was treated as having zero models, and the picker returned `null`.
+
+**Fix**: Normalise `models` to an array inside `fetchProviders()` using `Object.values()` when it is not already an array:
+
+```js
+const models = Array.isArray(rawModels) ? rawModels : Object.values(rawModels ?? {});
+```
+
+---
+
+## Bug 9 — Selecting a model caused 400 errors: "expected object, received string"
+
+**Symptom**: After selecting any model via the `/model` picker, every subsequent message failed with:
+
+```
+OpenCode 400: { "error": [{ "path": ["model"], "message": "Invalid input: expected object, received string" }] }
+```
+
+**Root cause**: The `prompt_async` body was built as `{ model: "anthropic/claude-sonnet-4-6", parts: [...] }`. The real OpenCode API requires `model` to be an object with `providerID` and `modelID` fields, not a plain string:
+
+```json
+{ "model": { "providerID": "anthropic", "modelID": "claude-sonnet-4-6" }, "parts": [...] }
+```
+
+**Fix**: In `sendPromptAsync`, split the internal `"provider/model"` string at the first `/` and construct the object before sending:
+
+```js
+const slash = model.indexOf("/");
+if (slash !== -1) {
+  body.model = { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
+}
+```
+
+The internal `"provider/model"` format is kept for storage compactness; the split only happens at the API call boundary.
+
+---
+
+## Bug 10 — `/model` picker listed all models at once, overwhelming the keyboard
+
+**Symptom**: With 3 connected providers (OpenCode Zen: 4, GitHub Copilot: 24, Anthropic: 23), the picker rendered a single inline keyboard with 51+ rows — one per model — plus provider header rows. Telegram delivered it but it was unusable: the chat was flooded with buttons and scrolling to find a specific model was impractical.
+
+**Root cause**: `buildModelKeyboard` iterated all providers and all models in a single loop with no pagination. This is fine for 2–3 models but breaks down at real-world scale.
+
+**Fix**: Introduced paginated model selection with provider tabs:
+
+- **8 models per page** (`MODELS_PER_PAGE = 8`) controlled by the constant at the top of the model selection section.
+- **Provider tab row** — one button per connected provider at the top of the keyboard. The active tab is prefixed with `●`. Tapping a tab fires `mprov:<idx>` and switches to that provider's first page.
+- **Prev / Next navigation row** — only rendered when a provider has more than one page. Uses `mpage:<providerIdx>:<page>` callbacks. A centre button shows the current page indicator (`1 / 3`). Spacer buttons (empty text, `model_noop`) keep the layout symmetric at the first/last page.
+- **No state stored for pagination** — the provider index and page number are embedded directly in each button's `callback_data`, so no `chatState` fields are needed and the view survives bot restarts without any rehydration logic.
+
+```
+Before (51 rows, all providers mixed):        After (paginated, one provider at a time):
+── Anthropic ──                               [● Anthropic] [GitHub Copilot] [OpenCode Zen]
+Claude Opus 4.5                               ── Anthropic — page 1/3 ──
+Claude Sonnet 4.6                             Claude Opus 4.5
+...23 more rows...                            Claude Sonnet 4.6 ✓
+── GitHub Copilot ──                          Claude Haiku 4.5
+GPT-5.3-Codex                                 ...5 more rows...
+...24 more rows...                            [  ‹ Prev  ]  [ 1 / 3 ]  [ Next › ]
+...etc...                                     [↩ Use OpenCode default]
+```

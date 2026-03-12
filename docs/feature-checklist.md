@@ -170,6 +170,86 @@ Paths that should **respect** the busy queue:
 
 ---
 
+---
+
+## Step 11 — Verify OpenCode API field shapes before assuming
+
+The OpenCode REST API evolves independently of this bot. Before calling any new endpoint or adding a new field to an existing call, **verify the real response shape** by curling the live server:
+
+```bash
+curl -s -u opencode: http://localhost:4096/<endpoint> | python3 -m json.tool | head -60
+```
+
+Common pitfalls already hit:
+
+| Assumption | Reality |
+|---|---|
+| `provider.models` is an array | It is a **dict** keyed by model ID — use `Object.values()` |
+| `prompt_async` accepts `model` as a string | It requires `{ providerID, modelID }` object |
+| `/provider` default is `{ provider, model }` | It is a flat dict `{ providerId: modelId }` covering all providers |
+
+**Rule**: When a field shape is non-obvious, add a comment in the code that documents the real shape, not the assumed one.
+
+---
+
+## Step 12 — `editMessageText` for stateful picker UIs
+
+Any feature that shows an interactive picker (model selection, settings, pagination) should **edit the existing message in place** rather than sending a new one. This keeps the chat clean.
+
+```js
+// Send once on command
+const sent = await bot.sendMessage(chatId, text, { reply_markup: keyboard });
+
+// On each button tap — edit the same message, not a new sendMessage
+await bot.editMessageText(newText, {
+  chat_id: chatId,
+  message_id: sent.message_id,
+  parse_mode: "Markdown",
+  reply_markup: updatedKeyboard,
+});
+```
+
+Consequence: the feature must track the `message_id` of the picker, or accept it from the callback query's `query.message.message_id`.
+
+---
+
+## Step 13 — Encode navigation state in `callback_data`, not in `chatState`
+
+For paginated or tabbed UIs, resist the temptation to store the current page/tab in `chatState`. Instead, encode it directly in each navigation button's `callback_data`:
+
+```js
+// Page navigation buttons carry their own destination
+{ text: "Next ›", callback_data: `mpage:${providerIdx}:${page + 1}` }
+{ text: "‹ Prev", callback_data: `mpage:${providerIdx}:${page - 1}` }
+
+// Tab buttons carry their own index
+{ text: "Anthropic", callback_data: `mprov:0` }
+{ text: "GitHub Copilot", callback_data: `mprov:1` }
+```
+
+Benefits:
+- **No rehydration needed** — the view rebuilds correctly from the callback data alone after a bot restart.
+- **No race conditions** — two simultaneous users opening the same picker don't share state.
+- **Simpler code** — the handler receives everything it needs from the callback; no state lookup required.
+
+The only caveat: verify that all possible `callback_data` values stay under Telegram's **64-byte hard limit** (see Step 2). For index-based pagination, worst-case values are very short (e.g. `mpage:2:9` = 9 bytes).
+
+---
+
+## Step 14 — Always reset page to 0 when switching dimensions in a paginated UI
+
+When a user switches a "dimension" of a paginated view (e.g. switches provider tab in the model picker), always reset the page counter to 0. Never carry the page from one dimension into another — the target dimension may have fewer pages, causing an out-of-bounds page to be clamped silently in `buildModelKeyboard` and confusing the user.
+
+```js
+// Tab switch: always reset page to 0
+if (data.startsWith("mprov:")) {
+  const providerIdx = parseInt(data.slice(6), 10);
+  await sendModelPicker(chatId, state, messageId, providerIdx, 0); // ← page always 0
+}
+```
+
+---
+
 ## Quick reference checklist
 
 ```
@@ -182,4 +262,8 @@ Paths that should **respect** the busy queue:
 [ ] SSE event handler is idempotent (handles replay without sending duplicates)
 [ ] Restart scenario tested manually end-to-end
 [ ] New user-input path respects or explicitly bypasses the busy queue
+[ ] API field shapes verified against live server before coding (not assumed)
+[ ] Picker UIs use editMessageText (not sendMessage) to avoid chat clutter
+[ ] Paginated UI: navigation state encoded in callback_data, not chatState
+[ ] Paginated UI: switching tabs/dimensions resets page to 0
 ```
