@@ -44,6 +44,7 @@ function setBotInstance(mockBot) {
  *   busy: boolean,               // AI is currently processing
  *   pendingQueue: string[],      // messages received while busy
  *   typingTimer: NodeJS.Timeout | null,
+ *   selectedModel: string | null, // e.g. "anthropic/claude-sonnet-4-5"; null = OpenCode default
  *   // Active interactions waiting for user response on Telegram
  *   pendingPermission: { requestId, messageId, timer } | null,
  *   pendingQuestions: [{ requestId, questions[], messageIds[], timer }] | null,
@@ -60,6 +61,7 @@ function getState(chatId) {
       busy: false,
       pendingQueue: [],
       typingTimer: null,
+      selectedModel: null,
       pendingPermission: null,
       questionState: null,
     });
@@ -100,11 +102,18 @@ async function createSession(chatId) {
   return session.id;
 }
 
-async function sendPromptAsync(sessionId, text) {
+async function sendPromptAsync(sessionId, text, model) {
   // Fire-and-forget — returns 204, AI response comes via SSE
-  await ocFetch("POST", `/session/${sessionId}/prompt_async`, {
-    parts: [{ type: "text", text }],
-  });
+  const body = { parts: [{ type: "text", text }] };
+  if (model) {
+    // OpenCode expects model as { providerID, modelID }, not a plain string.
+    // Our state stores it as "providerId/modelId" — split it here.
+    const slash = model.indexOf("/");
+    if (slash !== -1) {
+      body.model = { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
+    }
+  }
+  await ocFetch("POST", `/session/${sessionId}/prompt_async`, body);
 }
 
 async function replyPermission(requestId, reply) {
@@ -117,6 +126,59 @@ async function replyQuestion(requestId, answers) {
 
 async function rejectQuestion(requestId) {
   await ocFetch("POST", `/question/${requestId}/reject`, {});
+}
+
+/**
+ * Fetch providers and their models from OpenCode.
+ * Returns an array of { id, name, models: [{ id, name }] } objects
+ * filtered to providers that are "connected" (have valid API keys configured).
+ */
+async function fetchProviders() {
+  try {
+    const data = await ocFetch("GET", "/provider");
+    // data shape: { all: Provider[], default: { [providerId]: modelId }, connected: string[] }
+    const all = Array.isArray(data?.all) ? data.all : [];
+    const connected = Array.isArray(data?.connected) ? data.connected : [];
+    // Only show providers the user has actually configured (has API keys for)
+    const active = connected.length > 0
+      ? all.filter((p) => connected.includes(p.id))
+      : all;
+    // Normalise each provider so models is always an array of { id, name }
+    const normalised = active.map((p) => {
+      const rawModels = p.models;
+      let models;
+      if (Array.isArray(rawModels)) {
+        models = rawModels;
+      } else if (rawModels && typeof rawModels === "object") {
+        // Real OpenCode: models is a dict keyed by model ID
+        models = Object.values(rawModels);
+      } else {
+        models = [];
+      }
+      return { ...p, models };
+    });
+    // default is a dict { providerId -> modelId } in real OpenCode
+    const defaultMap = data?.default && typeof data.default === "object" ? data.default : null;
+    return { providers: normalised, defaultMap };
+  } catch (err) {
+    console.error("[fetchProviders]", err.message);
+    return { providers: [], defaultMap: null };
+  }
+}
+
+/**
+ * Return the default model string for the first connected provider, as
+ * "provider/model", using the server's default map.
+ */
+async function fetchDefaultModel() {
+  const { providers, defaultMap } = await fetchProviders();
+  if (!defaultMap || !providers.length) return null;
+  // Use the first connected provider that has a default entry
+  for (const p of providers) {
+    const modelId = defaultMap[p.id];
+    if (modelId) return `${p.id}/${modelId}`;
+  }
+  return null;
 }
 
 // Fetch final assembled AI text for a session's last assistant message
@@ -204,7 +266,7 @@ async function handleUserMessage(chatId, text) {
 
   try {
     const sessionId = await ensureSession(chatId);
-    await sendPromptAsync(sessionId, text);
+    await sendPromptAsync(sessionId, text, state.selectedModel || undefined);
     // Response will come via SSE events — we stay "busy" until session.idle or session.error
   } catch (err) {
     state.busy = false;
@@ -422,7 +484,11 @@ async function handleSessionIdle(chatId, sessionId) {
   try {
     const text = await fetchLastAssistantText(sessionId);
     if (text) {
-      await sendLong(chatId, text);
+      // Append the active model as a subtle footer so the user always knows which model answered
+      const modelTag = state.selectedModel
+        ? `\n\n_Model: ${state.selectedModel}_`
+        : "";
+      await sendLong(chatId, text + modelTag);
     } else {
       await bot.sendMessage(chatId, "_(no response)_").catch(() => {});
     }
@@ -563,6 +629,144 @@ async function connectSSE() {
   setTimeout(connectSSE, SSE_RECONNECT_DELAY_MS);
 }
 
+// ─── Model selection helpers ──────────────────────────────────────────────────
+
+const MODELS_PER_PAGE = 8;
+
+/**
+ * Build the paginated inline keyboard for model selection.
+ *
+ * Layout:
+ *   Row 1: Provider tabs  [● OpenCode Zen] [GitHub Copilot] [Anthropic]
+ *   Row 2: separator label
+ *   Rows 3…N: model buttons for the current page (MODELS_PER_PAGE per page)
+ *   Row N+1: [‹ Prev]  [Page X/Y]  [Next ›]   (omitted if only 1 page)
+ *   Row N+2: [↩ Use OpenCode default]
+ *
+ * providerIdx — index into the connected providers array (default 0)
+ * page        — 0-based page index within the current provider (default 0)
+ *
+ * callback_data prefixes used (all well under 64 bytes):
+ *   mprov:<providerIdx>          — switch provider tab
+ *   mpage:<providerIdx>:<page>   — navigate pages
+ *   model:<provider>/<modelId>   — select a model (unchanged)
+ *   model:default                — reset to OpenCode default (unchanged)
+ *   model_noop                   — non-interactive label (unchanged)
+ */
+async function buildModelKeyboard(state, providerIdx = 0, page = 0) {
+  const { providers, defaultMap } = await fetchProviders();
+  if (!providers.length) return null;
+
+  // Clamp indices
+  providerIdx = Math.max(0, Math.min(providerIdx, providers.length - 1));
+
+  const activeModel = state.selectedModel;
+
+  // Resolve the server default as "provider/modelId"
+  let resolvedDefault = null;
+  if (defaultMap) {
+    for (const p of providers) {
+      const mid = defaultMap[p.id];
+      if (mid) { resolvedDefault = `${p.id}/${mid}`; break; }
+    }
+  }
+
+  const rows = [];
+
+  // ── Row 1: provider tabs ──────────────────────────────────────────────────
+  const tabRow = providers.map((p, i) => ({
+    text: i === providerIdx ? `● ${p.name || p.id}` : p.name || p.id,
+    callback_data: i === providerIdx ? "model_noop" : `mprov:${i}`,
+  }));
+  rows.push(tabRow);
+
+  // ── Current provider's models ─────────────────────────────────────────────
+  const provider = providers[providerIdx];
+  const allModels = provider.models; // already normalised to array
+  const totalPages = Math.max(1, Math.ceil(allModels.length / MODELS_PER_PAGE));
+  page = Math.max(0, Math.min(page, totalPages - 1));
+
+  const pageModels = allModels.slice(page * MODELS_PER_PAGE, (page + 1) * MODELS_PER_PAGE);
+
+  // Separator label showing provider name + page context
+  const pageLabel = totalPages > 1 ? ` — page ${page + 1}/${totalPages}` : "";
+  rows.push([{ text: `── ${provider.name || provider.id}${pageLabel} ──`, callback_data: "model_noop" }]);
+
+  for (const m of pageModels) {
+    const modelId = m.id || m.name;
+    if (!modelId) continue;
+    const full = `${provider.id}/${modelId}`;
+    const isActive = activeModel ? full === activeModel : full === resolvedDefault;
+    rows.push([{
+      text: isActive ? `${m.name || modelId} ✓` : (m.name || modelId),
+      callback_data: `model:${full}`,
+    }]);
+  }
+
+  // ── Prev / Next navigation (only when >1 page) ────────────────────────────
+  if (totalPages > 1) {
+    const navRow = [];
+    if (page > 0) {
+      navRow.push({ text: "‹ Prev", callback_data: `mpage:${providerIdx}:${page - 1}` });
+    } else {
+      navRow.push({ text: " ", callback_data: "model_noop" });
+    }
+    navRow.push({ text: `${page + 1} / ${totalPages}`, callback_data: "model_noop" });
+    if (page < totalPages - 1) {
+      navRow.push({ text: "Next ›", callback_data: `mpage:${providerIdx}:${page + 1}` });
+    } else {
+      navRow.push({ text: " ", callback_data: "model_noop" });
+    }
+    rows.push(navRow);
+  }
+
+  // ── Reset to default ──────────────────────────────────────────────────────
+  rows.push([{ text: "↩ Use OpenCode default", callback_data: "model:default" }]);
+
+  return { inline_keyboard: rows };
+}
+
+/**
+ * Build the header text shown above the keyboard.
+ */
+async function buildModelPickerText(state) {
+  const resolvedDefault = await fetchDefaultModel();
+  const active = state.selectedModel || resolvedDefault || "OpenCode default";
+  return `*Model Selection*\n\nCurrent model: \`${active}\`\n\nChoose a model to use for this chat:`;
+}
+
+/**
+ * Send (or edit) the model picker message for a chat.
+ * providerIdx and page control which page of which provider is shown.
+ * If messageId is provided, edits that message instead of sending a new one.
+ */
+async function sendModelPicker(chatId, state, messageId, providerIdx = 0, page = 0) {
+  const keyboard = await buildModelKeyboard(state, providerIdx, page);
+  const text = await buildModelPickerText(state);
+
+  if (!keyboard) {
+    await bot.sendMessage(chatId,
+      `*Model Selection*\n\nNo providers found.\nMake sure OpenCode is running and providers are configured.`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+    return;
+  }
+
+  if (messageId) {
+    await bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: "Markdown",
+      reply_markup: keyboard,
+    }).catch(() => {});
+  } else {
+    await bot.sendMessage(chatId, text, {
+      parse_mode: "Markdown",
+      reply_markup: keyboard,
+    }).catch(() => {});
+  }
+}
+
 // ─── Telegram callback queries (button taps) ─────────────────────────────────
 
 if (require.main === module) {
@@ -609,6 +813,61 @@ bot.on("callback_query", async (query) => {
       console.error(`[callback perm] reply failed:`, err.message);
       await bot.sendMessage(chatId, `Failed to send permission response: ${err.message}`).catch(() => {});
     }
+    return;
+  }
+
+  // ── Model picker: non-interactive labels / spacers ──
+  if (data === "model_noop") {
+    return;
+  }
+
+  // ── Model picker: switch provider tab ──
+  // callback_data: "mprov:<providerIdx>"
+  if (data.startsWith("mprov:")) {
+    const providerIdx = parseInt(data.slice(6), 10);
+    const messageId = query.message?.message_id;
+    await sendModelPicker(chatId, state, messageId, providerIdx, 0);
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    return;
+  }
+
+  // ── Model picker: navigate pages within a provider ──
+  // callback_data: "mpage:<providerIdx>:<page>"
+  if (data.startsWith("mpage:")) {
+    const parts = data.split(":");
+    const providerIdx = parseInt(parts[1], 10);
+    const page = parseInt(parts[2], 10);
+    const messageId = query.message?.message_id;
+    await sendModelPicker(chatId, state, messageId, providerIdx, page);
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    return;
+  }
+
+  // ── Model picker: select a model or reset to default ──
+  // callback_data: "model:<provider>/<modelId>" or "model:default"
+  if (data.startsWith("model:")) {
+    const value = data.slice(6);
+    const messageId = query.message?.message_id;
+
+    if (value === "default") {
+      state.selectedModel = null;
+      await bot.answerCallbackQuery(query.id, { text: "Reset to OpenCode default" }).catch(() => {});
+    } else {
+      state.selectedModel = value;
+      // Show a short model name in the toast (last segment after the slash)
+      const shortName = value.includes("/") ? value.slice(value.indexOf("/") + 1) : value;
+      await bot.answerCallbackQuery(query.id, { text: `Switched to ${shortName}` }).catch(() => {});
+    }
+
+    // Rebuild the picker in place so the checkmark updates
+    const text = await buildModelPickerText(state);
+    const keyboard = await buildModelKeyboard(state) || { inline_keyboard: [] };
+    await bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: "Markdown",
+      reply_markup: keyboard,
+    }).catch(() => {});
     return;
   }
 
@@ -716,9 +975,15 @@ bot.onText(/\/abort/, async (msg) => {
 bot.onText(/\/help/, async (msg) => {
   await bot.sendMessage(
     msg.chat.id,
-    `*OpenCode Telegram Bot*\n\nSend any message to chat with the AI.\n\n*Commands:*\n/start — Connect to OpenCode\n/new — Start a fresh session\n/abort — Abort current AI task\n/help — Show this message\n\n*During a task:*\n• Permission requests will appear as buttons (Allow / Deny)\n• Questions will appear as buttons or free-text prompts\n• Multiple messages while busy are queued and processed in order`,
+    `*OpenCode Telegram Bot*\n\nSend any message to chat with the AI.\n\n*Commands:*\n/start — Connect to OpenCode\n/new — Start a fresh session\n/model — View & change the AI model\n/abort — Abort current AI task\n/help — Show this message\n\n*During a task:*\n• Permission requests will appear as buttons (Allow / Deny)\n• Questions will appear as buttons or free-text prompts\n• Multiple messages while busy are queued and processed in order\n\n*Model selection:*\n• Use /model to open the model picker\n• The active model is shown at the bottom of every response\n• Tap "↩ Use OpenCode default" to reset to the server default`,
     { parse_mode: "Markdown" }
   );
+});
+
+bot.onText(/\/model/, async (msg) => {
+  const chatId = msg.chat.id;
+  const state = getState(chatId);
+  await sendModelPicker(chatId, state);
 });
 
 bot.on("message", async (msg) => {
@@ -814,6 +1079,8 @@ if (typeof module !== "undefined" && module.exports) {
     replyQuestion,
     rejectQuestion,
     fetchLastAssistantText,
+    fetchProviders,
+    fetchDefaultModel,
     // Typing
     startTyping,
     stopTyping,
@@ -821,6 +1088,9 @@ if (typeof module !== "undefined" && module.exports) {
     sendLong,
     // Session
     ensureSession,
+    // Model selection
+    buildModelKeyboard,
+    sendModelPicker,
     // Handlers
     handleUserMessage,
     drainQueue,

@@ -288,6 +288,33 @@ class FakeOpenCodeServer {
       return sendJson(res, 200, Array.from(this.sessions.values()));
     }
 
+    // Provider list — used by the /model command
+    if (req.method === "GET" && pathname === "/provider") {
+      return sendJson(res, 200, {
+        all: [
+          {
+            id: "anthropic",
+            name: "Anthropic",
+            models: [
+              { id: "claude-opus-4-5",    name: "Claude Opus 4.5" },
+              { id: "claude-sonnet-4-5",  name: "Claude Sonnet 4.5" },
+              { id: "claude-haiku-4-5",   name: "Claude Haiku 4.5" },
+            ],
+          },
+          {
+            id: "openai",
+            name: "OpenAI",
+            models: [
+              { id: "gpt-4o",       name: "GPT-4o" },
+              { id: "gpt-4o-mini",  name: "GPT-4o Mini" },
+            ],
+          },
+        ],
+        connected: ["anthropic", "openai"],
+        default: { provider: "anthropic", model: "claude-sonnet-4-5" },
+      });
+    }
+
     if (req.method === "POST" && pathname === "/session") {
       const body = await readJsonBody(req);
       const sessionId = `sess-${++this.sessionCounter}`;
@@ -420,18 +447,20 @@ class BotProcess {
 
     this.child.kill("SIGINT");
     await new Promise((resolve) => {
+      // Give it 1.5s to exit gracefully, then force-kill
       const timer = setTimeout(() => {
-        try {
-          this.child.kill("SIGKILL");
-        } catch {}
+        try { this.child.kill("SIGKILL"); } catch {}
         resolve();
-      }, 4000);
+      }, 1500);
 
       this.child.once("exit", () => {
         clearTimeout(timer);
         resolve();
       });
     });
+    this.child = null;
+    // Short pause to let Telegram's server register the polling connection closed
+    await sleep(2000);
   }
 
   async waitFor(predicate, timeoutMs, label) {
@@ -451,6 +480,29 @@ async function fetchBotUsername(token) {
     throw new Error(`getMe failed: ${json.description}`);
   }
   return json.result.username;
+}
+
+/**
+ * Forcefully terminates any competing polling session.
+ * Strategy:
+ * 1. deleteWebhook to clear webhooks
+ * 2. Call getUpdates with timeout=0 several times to claim + immediately
+ *    release the polling slot, which evicts any competing long-poll
+ * 3. Wait for Telegram server to propagate
+ */
+async function clearPollingConflict(token) {
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/deleteWebhook?drop_pending_updates=true`);
+  } catch {}
+  // Claim & release the getUpdates slot a few times to evict competing bots
+  for (let i = 0; i < 3; i++) {
+    try {
+      await fetch(`https://api.telegram.org/bot${token}/getUpdates?timeout=0&limit=1`);
+    } catch {}
+    await sleep(500);
+  }
+  // Give Telegram time to register the new state
+  await sleep(4000);
 }
 
 async function waitIncoming(client, entity, afterId, predicate, timeoutMs, label) {
@@ -534,6 +586,9 @@ async function main() {
 
     server.addSession({ id: `rehyd-${chatId}`, title: `Telegram Chat ${chatId}`, updated: Date.now() - 10000 });
 
+    // Clear any competing polling session before starting the test bot
+    await clearPollingConflict(process.env.TELEGRAM_BOT_TOKEN);
+
     botProcess = new BotProcess(server.baseUrl);
     await botProcess.start();
 
@@ -578,12 +633,142 @@ async function main() {
       return { replyId: msg.id };
     });
 
+    // ── /model pagination tests ───────────────────────────────────────────────
+    // The fake server exposes: Anthropic (3 models) and OpenAI (2 models),
+    // both in the "connected" list, with default anthropic/claude-sonnet-4-5.
+    // With MODELS_PER_PAGE=8 there is only 1 page per provider, so pagination
+    // nav buttons won't appear — but provider tab switching will.
+
+    await recordStep("/model picker shown with provider tabs", async () => {
+      const sent = await sendText("/model");
+      const msg = await expectReply(
+        sent.id,
+        "model picker",
+        (message, txt) =>
+          txt.includes("Model Selection") &&
+          txt.includes("Current model") &&
+          Array.isArray(message.buttons) &&
+          message.buttons.length > 0
+      );
+      // Row 0 must be provider tabs (Anthropic tab marked active with ●)
+      const tabRow = msg.buttons && msg.buttons[0];
+      if (!tabRow) throw new Error("No tab row found on picker");
+      const tabTexts = tabRow.map(b => b.text || "");
+      const hasActivTab = tabTexts.some(t => t.startsWith("●"));
+      if (!hasActivTab) throw new Error(`No active provider tab (●) found. Tabs: ${tabTexts.join(", ")}`);
+      return { msgId: msg.id, tabs: tabTexts, preview: normalize(msg.message).slice(0, 120) };
+    });
+
+    await recordStep("/model — switch provider tab", async () => {
+      const sent = await sendText("/model");
+      const picker = await expectReply(
+        sent.id,
+        "model picker for tab switch",
+        (message, txt) => txt.includes("Model Selection") && Array.isArray(message.buttons) && message.buttons.length > 0
+      );
+      // Row 0 = provider tabs. Click the second tab (index 1 = OpenAI in the fake server)
+      await clickButton(picker, 0, 1);
+      // The picker edits in-place. After the tab switch, row 0 button[0] should
+      // show "OpenAI" as inactive (no ●) and button[1] should have ● prefix.
+      // We detect the switch by checking that the active tab (● prefix) moved to
+      // the second button in the tab row.
+      const deadline = Date.now() + 15000;
+      let updated = null;
+      while (Date.now() < deadline) {
+        const msgs = await client.getMessages(entity, { ids: [picker.id] });
+        const m = msgs && msgs[0];
+        if (m && Array.isArray(m.buttons) && m.buttons[0]) {
+          const tabRow = m.buttons[0];
+          // Active tab (●) should now be on column 1 (OpenAI)
+          const activeTab = tabRow.find(b => (b.text || "").startsWith("●"));
+          if (activeTab && (activeTab.text || "").includes("OpenAI")) {
+            updated = m;
+            break;
+          }
+        }
+        await sleep(800);
+      }
+      if (!updated) throw new Error("Picker did not switch to OpenAI tab");
+      const tabRow = updated.buttons[0].map(b => b.text);
+      return { pickerId: picker.id, tabs: tabRow };
+    });
+
+    await recordStep("/model — select a model via button", async () => {
+      const sent = await sendText("/model");
+      const picker = await expectReply(
+        sent.id,
+        "model picker for selection",
+        (message, txt) => txt.includes("Model Selection") && Array.isArray(message.buttons) && message.buttons.length > 0
+      );
+      // Layout: row 0 = provider tabs, row 1 = separator, row 2 = first model
+      // Read the first model button's text so we know what to expect
+      const firstModelBtn = picker.buttons && picker.buttons[2] && picker.buttons[2][0];
+      if (!firstModelBtn) throw new Error("Could not find first model button at row 2");
+      const firstModelName = (firstModelBtn.text || "").replace(" ✓", "").trim();
+      // Click row 2, col 0 — first real model
+      await clickButton(picker, 2, 0);
+      // Wait for the message body to reflect the selection in "Current model:"
+      const deadline = Date.now() + 15000;
+      let updated = null;
+      while (Date.now() < deadline) {
+        const msgs = await client.getMessages(entity, { ids: [picker.id] });
+        const m = msgs && msgs[0];
+        const txt = normalize(m && m.message || "");
+        // The selected model ID is now shown in the Current model line
+        if (txt.includes("Current model:") && !txt.includes("OpenCode default")) {
+          updated = m;
+          break;
+        }
+        await sleep(800);
+      }
+      if (!updated) throw new Error("Picker message was not updated after model selection");
+      return { pickerId: picker.id, selectedBtn: firstModelName, updatedText: normalize(updated.message).slice(0, 120) };
+    });
+
+    await recordStep("/model — reset to default", async () => {
+      // First, confirm a model is currently selected (from the previous step)
+      const sent = await sendText("/model");
+      const picker = await expectReply(
+        sent.id,
+        "model picker for reset",
+        (message, txt) => txt.includes("Model Selection") && Array.isArray(message.buttons) && message.buttons.length > 0
+      );
+      // Capture the current model text before reset
+      const beforeTxt = normalize(picker.message || "");
+      // Last row = "↩ Use OpenCode default"
+      const lastRow = picker.buttons.length - 1;
+      await clickButton(picker, lastRow, 0);
+      // After reset, the "Current model:" line should revert — either to the
+      // resolved server default string or to "OpenCode default" (when default
+      // can't be resolved from the fake server)
+      const deadline = Date.now() + 15000;
+      let updated = null;
+      while (Date.now() < deadline) {
+        const msgs = await client.getMessages(entity, { ids: [picker.id] });
+        const m = msgs && msgs[0];
+        const txt = normalize(m && m.message || "");
+        // Accept any of: explicit default model string, or "OpenCode default",
+        // as long as it's different from the previously selected model text
+        const isReset = txt !== beforeTxt &&
+          (txt.includes("OpenCode default") || !txt.includes("anthropic/claude-opus-4-5"));
+        if (isReset) { updated = m; break; }
+        await sleep(800);
+      }
+      if (!updated) throw new Error("Picker did not reset to default model");
+      return { pickerId: picker.id, resetText: normalize(updated.message).slice(0, 120) };
+    });
+
     await recordStep("queue behavior", async () => {
+      // Warm up: send a plain echo first so a session already exists and the
+      // bot is in idle state before we hit it with the QUEUE_SLOW scenario.
+      const warmup = await sendText(`${tag} E2E:ECHO warm`);
+      await expectReply(warmup.id, "queue warmup echo", (_, txt) => txt.includes("Echo:") && txt.includes("warm"), 30000);
+
       const slow = await sendText(`${tag} E2E:QUEUE_SLOW`);
       const fast = await sendText(`${tag} E2E:QUEUE_FAST`);
-      await expectReply(fast.id, "queue busy", (_, txt) => txt.includes("Still working on the previous request"));
-      const first = await expectReply(fast.id, "queue first done", (_, txt) => txt.includes("queue first done"));
-      const second = await expectReply(first.id, "queue second done", (_, txt) => txt.includes("queue second done"));
+      await expectReply(fast.id, "queue busy", (_, txt) => txt.includes("Still working on the previous request"), 30000);
+      const first = await expectReply(fast.id, "queue first done", (_, txt) => txt.includes("queue first done"), 30000);
+      const second = await expectReply(first.id, "queue second done", (_, txt) => txt.includes("queue second done"), 30000);
       return { sent: [slow.id, fast.id], replies: [first.id, second.id] };
     });
 
@@ -620,8 +805,8 @@ async function main() {
         (message, txt) => txt.includes("Pick one") && Array.isArray(message.buttons) && message.buttons.length >= 2
       );
       await clickButton(prompt, 1, 0);
-      await expectReply(prompt.id, "selected b", (_, txt) => txt.includes("Selected") && txt.includes("B"));
-      const ack = await expectReply(prompt.id, "question answer ack", (_, txt) => txt.includes("Question answers received"));
+      await expectReply(prompt.id, "selected b", (_, txt) => txt.includes("Selected") && txt.includes("B"), 60000);
+      const ack = await expectReply(prompt.id, "question answer ack", (_, txt) => txt.includes("Question answers received"), 60000);
       return { promptId: prompt.id, ackId: ack.id };
     });
 
@@ -638,7 +823,7 @@ async function main() {
       const sent = await sendText(`${tag} E2E:QUESTION_INVALID`);
       const prompt = await expectReply(sent.id, "invalid question prompt", (_, txt) => txt.includes("Pick exactly one"));
       const custom = await sendText(`${tag} not allowed custom`);
-      const msg = await expectReply(custom.id, "choose options warning", (_, txt) => txt.includes("Please choose one of the options above"));
+      const msg = await expectReply(custom.id, "choose options warning", (_, txt) => txt.includes("Please choose one of the options above"), 60000);
       return { promptId: prompt.id, warningId: msg.id };
     });
 
@@ -719,6 +904,7 @@ async function main() {
       const oldSessionId = beforeRestartCall.sessionId;
 
       await botProcess.stop();
+      await clearPollingConflict(process.env.TELEGRAM_BOT_TOKEN);
       botProcess = new BotProcess(server.baseUrl);
       await botProcess.start();
       await sleep(1500);

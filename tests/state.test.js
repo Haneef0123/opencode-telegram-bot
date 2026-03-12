@@ -26,6 +26,7 @@ describe("getState", () => {
       busy: false,
       pendingQueue: [],
       typingTimer: null,
+      selectedModel: null,
       pendingPermission: null,
       questionState: null,
     });
